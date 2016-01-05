@@ -1,9 +1,9 @@
 #!/usr/bin/env perl
 #=======================================================================
-#	$Id: ptwbc,v 1.4 2011/10/21 20:55:26 pythontech Exp $
 #	HTTP client for ptwb
 #=======================================================================
 use strict;
+use File::Path qw(remove_tree);
 use LWP;
 use HTTP::Request::Common;
 use HTTP::Cookies;
@@ -14,7 +14,7 @@ my $env = { map {$_=>undef}
 	    qw(proxyurl proxyrealm proxyusername proxypassword
 	       url realm username password pathencode
 	       loginurl) };
-my($debug,$verbose,$silent,$throttle,@exclude);
+my($debug,$verbose,$silent,$remove,$throttle,@exclude);
 
 #-----------------------------------------------------------------------
 #	Subclass UserAgent to deal with proxy authentication
@@ -50,7 +50,6 @@ my($debug,$verbose,$silent,$throttle,@exclude);
     sub mirror {
 	my($self, $url, $file) = @_;
 
-	LWP::Debug::trace('()');
 	my $request = HTTP::Request->new('GET', $url);
 	$request->header(Accept => '*/*');
 
@@ -113,6 +112,7 @@ my $config;
 GetOptions("d|debug" => \$debug,
 	   "c|config=s" => \$config,
 	   "x|exclude=s" => \@exclude,
+	   "r|remove" => \$remove,
 	   "t|throttle=i" => \$throttle,
 	   "v|verbose" => \$verbose,
 	   "s|silent" => \$silent) || usage;
@@ -230,18 +230,19 @@ sub ptwb_dir {
 	($verbose ? $response->content : '');
     } else {
 	sleep($throttle) if $throttle;
+	my %old = map {$_ => 1} read_dir($dir);
 	my @items = split /\n/, $response->content;
 	foreach my $item (@items) {
 	    my($type,$name,$mode,$size,$modtime,$link) = split / /,$item;
 	    #--- Decode URL-encoded name
 	    $name =~ s/\%([0-9A-F]{2})/chr(hex($1))/eg;
 	    $link =~ s/\%([0-9A-F]{2})/chr(hex($1))/eg;
-	    my $relname = "$dir/$name";
-	    $relname =~ s!^\./!!;
+	    (my $relname = "$dir/$name") =~ s!^\./!!;
 	    if ($relname =~ /$excluderx/) {
 		print STDERR "Excluded  $relname\n" if $verbose;
 		next;
 	    }
+	    delete $old{$name};
 	    if ($type eq 'd') {
 		my $subdir = $relname;
 
@@ -282,6 +283,20 @@ sub ptwb_dir {
 		symlink $link, $file or
 		    die "Cannot create symlink $file: $!\n";
 		print STDERR "Linking   $file\n" unless $silent;
+	    }
+	}
+
+	if ($remove) {
+	    foreach my $name (sort keys %old) {
+		(my $relname = "$dir/$name") =~ s!^\./!!;
+		print STDERR "Removing  $relname\n" unless $silent;
+		if (-l $relname || ! -d $relname) {
+		    print STDERR "rm $relname\n" if $verbose;
+		    unlink $relname;
+		} else {
+		    print STDERR "rm -rf $relname\n" if $verbose;
+		    remove_tree($relname);
+		}
 	    }
 	}
     }
@@ -376,6 +391,15 @@ sub read_auth {
     my($username,$password) = split(/:/, $line,2);
     close(AUTH);
     return ($username,$password);
+}
+
+sub read_dir {
+    my($dir) = @_;
+    opendir(DIR,$dir)
+	or die "Cannot opendir $dir: $!\n";
+    my @items = grep {$_ ne '.' && $_ ne '..'} readdir(DIR);
+    closedir(DIR);
+    return @items;
 }
 
 sub rot13 {
