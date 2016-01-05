@@ -1,0 +1,394 @@
+#!/usr/bin/perl
+#=======================================================================
+#	$Id: ptwb,v 1.5 2016/01/05 20:08:50 pythontech Exp $
+#	Simple recursive backup (CGI application).
+#	To be used in conjunction with ptwbc client.
+#	See also PythonTech::WebFiler which is more comprehensive but
+#	requires more infrastructure.
+#=======================================================================
+package Ptwb;
+use strict;
+use CGI;
+use HTTP::Date;
+use File::Spec;
+
+# Configuration
+my $HOME = (getpwuid($>))[7];
+my $BASEPATH = "$HOME";
+my $SESSIONDIR = "$HOME/sessions";
+my $USERDB = {
+    'my.username' => 'crypted-password',
+};
+
+# Run query
+eval { &main };
+print "Status: 500\n\n$@" if $@;
+
+sub main {
+    my $query = CGI->new;
+    my $self = {
+		query => $query,
+		cookies => [],
+	       };
+    bless $self, 'Ptwb';
+    #--- Find or establish session
+    $self->get_session;
+    my $method = $query->request_method;
+    if ($method eq 'POST') {
+	$self->login;
+    } elsif ($method eq 'GET') {
+	$self->fetch;
+    } else {
+	die "Unknown method '$method'\n";
+    }
+}
+
+sub query {shift->{'query'}}
+sub session {shift->{'session'}}
+
+sub qurl {
+    my($self,@args) = @_;
+    my $url = $self->query->url(-path_info => 1);
+    my @qa;
+    while (my($name,$value) = splice(@args,0,2)) {
+	push @qa, uq($name).'='.uq($value);
+    }
+    if (@qa) {
+	$url .= "?" . join("&",@qa);
+    }
+    return $url;
+}
+
+#-----------------------------------------------------------------------
+#	User is posting credentials
+#-----------------------------------------------------------------------
+sub login {
+    my($self) = @_;
+    my $error;
+    my $username = $self->query->param('username');
+    my $password = $self->query->param('password');
+    if ($username eq '') {
+	$error = "Missing username";
+    } elsif ($username eq '') {
+	$error = "Missing password";
+    } elsif (! defined $USERDB->{$username}) {
+	$error = "Unknown username";
+    } else {
+	my $crypted = $USERDB->{$username};
+	if (crypt($password, $crypted) ne $crypted) {
+	    $error = "Wrong password";
+	} else {
+	    # Success
+	    $self->set('userName' => $username);
+	    $self->see_other('action' => 'show');
+	    return;
+	}
+    }
+    $self->login_page($error, $username);
+}
+
+sub login_page {
+    my($self, $error,$username) = @_;
+    print($self->headers,
+	  &page('Log In',
+		&stag('form', method=>'POST', action=>$self->qurl),
+		($error ? &stag('p', class=>'error').hq($error)."</p>" : ""),
+		&Hhidden(action=>'login'),
+		"User: ",&Htext(username => $username),"<br />",
+		"Password: ",&Hpassword(password=>''),
+		&Hsubmit(undef, 'Log in'),
+		"</form>"));
+}
+
+#-----------------------------------------------------------------------
+#	User is requesting listing or file
+#-----------------------------------------------------------------------
+sub fetch {
+    my($self) = @_;
+    if ($self->get('userName') eq '') {
+	$self->login_page();
+	return;
+    }
+    my $tpath;
+    if (defined($tpath = $self->query->param('path'))) {
+	;
+    } elsif (defined($tpath = $self->query->param('path13'))) {
+	# ROT13'ed to evade pipeten's over-zealous mod_security
+	$tpath =~ tr/A-Za-z/N-ZA-Mn-za-m/;
+    } else {
+	die "No path defined\n";
+    }
+    my($path) = $tpath =~ m!^([^\0]*)$!
+	or die "Invalid NUL in path\n";
+    # $path is URL-syntax, i.e. "/" separated, URL-encoded segments
+    my @segments = (grep {$_ ne '.' && $_ ne ''}
+		    map {ux($_)}
+		    split(m!/!, $path, length($path)));
+    die "'..' not allowed\n"
+      if grep {$_ eq '..'} @segments;
+
+    # Resolve via basepath, which may be nested hashes
+    my $base = $BASEPATH;
+    while (ref($base) eq 'HASH') {
+	if (@segments == 0) {
+	    # Listing of virtual directory
+	    my @listing;
+	    foreach my $leaf (sort keys %$base) {
+		push @listing, sprintf("d %s %o %d %d %s\n",
+				       &uq($leaf),
+				       040755, # Mode
+				       1, # Size
+				       time(), # Modtime
+				       "");
+	    }
+	    $self->listdir(@listing);
+	    return 1;
+	} else {
+	    # Step down in the hash until scalar seen - a real directory name
+	    my $seg = shift @segments;
+	    my $item = $base->{$seg};
+	    if (! defined $item) {
+		return $self->not_found($path);
+	    }
+	    $base = $item;
+	}
+    }
+
+    my $rel = File::Spec->catdir(@segments);
+    my $fullpath = File::Spec->rel2abs($rel, $base);
+
+    if (-d $fullpath) {
+	my @listing;
+	if (! -r $fullpath) {
+	    # die "Directory $fullpath is not readable: $!\n";
+	} elsif (! opendir(DIR,$fullpath)) {
+	    # die "Cannot open directory $fullpath for read: $!\n";
+	} else {
+	    # Ignore ".." and "."
+	    my @leaves = File::Spec->no_upwards(readdir(DIR));
+	    closedir(DIR);
+	    foreach my $leaf (@leaves) {
+		my $filename = File::Spec->rel2abs($leaf, $fullpath);
+		my @stat = stat($filename);
+		push @listing, sprintf("%s %s %o %d %d %s\n",
+				       -l $filename ? "l" :
+				       -d $filename ? "d" :
+				       -f $filename ? "f" : "?",
+				       &uq($leaf),
+				       $stat[2], # Mode
+				       $stat[7], # Size
+				       $stat[9], # Modtime
+				       -l $filename ? &uq(readlink($filename)) : "");
+	    }
+	}
+	$self->listdir(@listing);
+    } elsif (-f $fullpath) {
+	my $mtime = (stat $fullpath)[9];
+	open(FILE,'<',$fullpath) || 
+	    die "Cannot open $fullpath for read: $!\n";
+	binmode(FILE);
+	print $self->query->header(-type=>"application/octet-stream",
+				   -last_modified=>&HTTP::Date::time2str($mtime));
+	my $data;
+	while (read(FILE,$data,4096)) {
+	    print $data;
+	}
+	close(FILE);
+    } else {
+	return $self->not_found($path);
+    }
+    1;
+}
+
+sub listdir {
+    my($self, @listing) = @_;
+#    print $self->query->header(-type=>"application/x-ptwb-dir");
+    print $self->query->header(-type=>"text/plain");
+    print @listing;
+}
+
+sub not_found {
+    my($self,$path) = @_;
+    print $self->query->header(-status=>404);
+    print "<title>Not found</title>$path not found";
+    1;
+}
+
+#-----------------------------------------------------------------------
+#	Find or establish session
+#-----------------------------------------------------------------------
+sub get_session {
+    my($self) = @_;
+    my $session;
+    my $tsessid = $self->query->cookie('SESSID');
+    if (my($sessid) = $tsessid =~ m!^([a-z0-f]{32})$!) {
+	my $sessfile = File::Spec->rel2abs("sess_$sessid",$SESSIONDIR);
+	if (-f $sessfile && -w $sessfile) {
+	    if (open(SESSION,'<',$sessfile)) {
+		$self->{'sessionid'} = $sessid;
+		$self->{'session'} = { map {ux($_)} split /\s+/, <SESSION> };
+		close(SESSION);
+		return;
+	    }
+	}
+    }
+
+    # No cookie, or invalid / expired id
+    my $oldumask = umask(077);
+    for (my $i=0; $i<10; $i++) {
+	my $sessid = sprintf("%08x%08x%08x%08x",
+			     time ^ int(rand(4294967296)),
+			     $$ ^ int(rand(4294967296)),
+			     time ^ int(rand(4294967296)),
+			     time ^ int(rand(4294967296)));
+	my $sessfile = File::Spec->rel2abs("sess_$sessid",$SESSIONDIR);
+	if (! -f $sessfile) {
+#	    print STDERR "trying $sessfile\n";
+	    if (open(SESSION,'>',$sessfile)) {
+		close(SESSION);
+		$self->{'sessionid'} = $sessid;
+		$self->{'session'} = {};
+		my $cookie = $self->query->cookie(SESSID => $sessid);
+		push @{$self->{'cookies'}}, $cookie;
+		last;		# Success
+	    }
+	}
+    }
+    umask($oldumask);
+    $self->{'session'} or
+	die "Cannot create session after 10 tries";
+}
+
+sub save_session {
+    my($self) = @_;
+    if ($self->{'mod_session'}) {
+	my $sessid = $self->{'sessionid'};
+	my $sessfile = File::Spec->rel2abs("sess_$sessid",$SESSIONDIR);
+	open(SESSION,'>',$sessfile) or
+	    die "Cannot open $sessfile for write: $!";
+	print SESSION join(" ",map {uq($_)} %{$self->{'session'}}),"\n";
+	close(SESSION);
+    }
+}
+
+#-----------------------------------------------------------------------
+#	Get / set a session variable
+#-----------------------------------------------------------------------
+sub get {
+    my($self, $key) = @_;
+    return $self->{'session'}->{$key};
+}
+
+sub set {
+    my($self, $key,$value) = @_;
+    $self->{'session'}->{$key} = $value;
+    $self->{'mod_session'} = 1;
+}
+
+#-----------------------------------------------------------------------
+#	HTTP headers and HTML generation
+#-----------------------------------------------------------------------
+sub headers {
+    my($self) = @_;
+    $self->save_session;
+    return $self->query->header(-cookie => $self->{'cookies'});
+}
+
+sub see_other {
+    my($self, @args) = @_;
+    $self->save_session;
+    my $url = $self->qurl(@args);
+    my $hurl = hq($url);
+    print($self->query->header(-status => '303 See Other',
+			       -location => $url,
+			       -cookie => $self->{'cookies'}),
+	  "<html><head>",
+	  &tag('meta', 'http-equiv'=>'Refresh', content=>"0; URL=$url"),
+	  "<title>Now go here</title>",
+	  "</head>",
+	  "<body>Continue <a href=\"$hurl\">here</a>",
+	  "</body></html>");
+}
+
+sub page {
+    my($title,@rest) = @_;
+    my $html = join('',
+		    '<html>
+<head>
+<title>Ptwb: ',hq($title),'</title>
+<style type="text/css">
+TH { background: #CFC }
+.error { background: #FCC }
+</style>
+</head>
+',
+		    @rest,
+		    '</body>
+</html>
+');
+    return $html;
+}
+
+sub tag {
+    my($tag,@attr) = @_;
+    my $html = "<$tag";
+    while (my($attr,$value) = splice(@attr,0,2)) {
+	$html .= " $attr=\"" . hq($value) . "\"";
+    }
+    $html .= ' />';
+    return $html;
+}
+
+sub stag {
+    my($tag,@attr) = @_;
+    my $html = "<$tag";
+    while (my($attr,$value) = splice(@attr,0,2)) {
+	$html .= " $attr=\"" . hq($value) . "\"";
+    }
+    $html .= '>';
+    return $html;
+}
+
+sub Hhidden {
+    my($name,$value) = @_;
+    &tag('input', type=>'hidden', name=>$name, value=>$value);
+}
+
+sub Hpassword {
+    my($name,$value) = @_;
+    &tag('input', type=>'password', name=>$name, value=>$value);
+}
+
+sub Htext {
+    my($name,$value,@extra) = @_;
+    &tag('input', type => 'text', name => $name, value => $value,
+	 @extra);
+}
+
+sub Hsubmit {
+    my($name,$value) = @_;
+    &tag('input', type => 'submit',
+	 (defined $name ? (name => $name) : ()),
+	 value => $value);
+}
+
+sub hq {
+    my($text) = @_;
+    $text =~ s/\&/\&amp;/g;
+    $text =~ s/\</\&lt;/g;
+    $text =~ s/\>/\&gt;/g;
+    $text =~ s/\"/\&quot;/g;
+    return $text;
+}
+
+sub uq {
+    my($text) = @_;
+    $text =~ s/[^-\w\.\~]/sprintf("%%%02X",ord($&))/eg;
+    return $text;
+}
+
+sub ux {
+    my($text) = @_;
+    $text =~ s/%([0-9a-fA-F][0-9a-fA-F])/pack("C", hex($1))/eg;
+    return $text;
+}

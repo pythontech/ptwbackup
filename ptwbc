@@ -1,0 +1,385 @@
+#!/usr/bin/env perl
+#=======================================================================
+#	$Id: ptwbc,v 1.4 2011/10/21 20:55:26 pythontech Exp $
+#	HTTP client for ptwb
+#=======================================================================
+use strict;
+use LWP;
+use HTTP::Request::Common;
+use HTTP::Cookies;
+use URI;
+use Getopt::Long;
+
+my $env = { map {$_=>undef} 
+	    qw(proxyurl proxyrealm proxyusername proxypassword
+	       url realm username password pathencode
+	       loginurl) };
+my($debug,$verbose,$silent,$throttle,@exclude);
+
+#-----------------------------------------------------------------------
+#	Subclass UserAgent to deal with proxy authentication
+#-----------------------------------------------------------------------
+{
+    package Ptwb::UserAgent;
+    our @ISA = qw(LWP::UserAgent);
+
+    sub new {
+	my $self = LWP::UserAgent::new(@_);
+	$self->agent('ptwb');
+	$self;
+    }
+
+    # Local method to read credentials from file
+    sub get_basic_credentials {
+	my($self, $realm,$uri,$proxy) = @_;
+	if ($debug) {
+	    print STDERR "Auth request realm=$realm proxy=$proxy\n";
+	}
+	if ($realm eq $env->{'proxyrealm'}) {
+	    return ($env->{'proxyusername'}, $env->{'proxypassword'});
+	} elsif ($realm eq $env->{'realm'}) {
+	    return ($env->{'username'}, $env->{'password'});
+	} else {
+	    print STDERR "Auth request for unknown realm \"$realm\" at $uri\n";
+	    return (undef, undef);
+	}
+    }
+
+    # Also subclass mirror, to ensure Accept: header is set
+    # Pipeten are picky about this and give a 403 is we don't.
+    sub mirror {
+	my($self, $url, $file) = @_;
+
+	LWP::Debug::trace('()');
+	my $request = HTTP::Request->new('GET', $url);
+	$request->header(Accept => '*/*');
+
+	if (-e $file) {
+	    my($mtime) = (stat($file))[9];
+	    if($mtime) {
+		$request->header('If-Modified-Since' =>
+				   HTTP::Date::time2str($mtime));
+	    }
+	}
+	my $tmpfile = "$file-$$";
+
+	my $response = $self->request($request, $tmpfile);
+	if ($response->is_success) {
+
+	    my $file_length = (stat($tmpfile))[7];
+	    my($content_length) = $response->header('Content-length');
+
+	    if (defined $content_length and $file_length < $content_length) {
+		unlink($tmpfile);
+		die "Transfer truncated: " .
+		  "only $file_length out of $content_length bytes received\n";
+	    }
+	    elsif (defined $content_length and $file_length > $content_length) {
+		unlink($tmpfile);
+		die "Content-length mismatch: " .
+		  "expected $content_length bytes, got $file_length\n";
+	    }
+	    else {
+		# OK
+		if (-e $file) {
+		    # Some dosish systems fail to rename if the target exists
+		    chmod 0777, $file;
+		    unlink $file;
+		}
+		rename($tmpfile, $file) or
+		  die "Cannot rename '$tmpfile' to '$file': $!\n";
+
+		if (my $lm = $response->last_modified) {
+		    # make sure the file has the same last modification time
+		    utime $lm, $lm, $file;
+		}
+	    }
+	}
+	else {
+	    unlink($tmpfile);
+	}
+	return $response;
+    }
+}
+
+#-----------------------------------------------------------------------
+#	Main program
+#-----------------------------------------------------------------------
+(my $myname = $0) =~ s!.*/!!;
+sub usage {die "Usage: $myname [-d] [-v|-s] [-t secs] [-c configfile]\n";}
+
+my $config;
+&Getopt::Long::config('bundling');
+GetOptions("d|debug" => \$debug,
+	   "c|config=s" => \$config,
+	   "x|exclude=s" => \@exclude,
+	   "t|throttle=i" => \$throttle,
+	   "v|verbose" => \$verbose,
+	   "s|silent" => \$silent) || usage;
+usage unless @ARGV == 0;
+
+if (defined $config) {
+    &read_config($config);
+}
+die "$0: No url defined in configuration\n"
+    unless defined $env->{'url'};
+if ($debug) {
+    print "==ENV==\n";
+    while(my($k,$v) = each %$env) {
+	print "$k=$v\n";
+    }
+}
+my $excluderx = ('^(' .
+		 join('|',
+		      map {
+			  s![^\w\.\*\?]!\\$&!g;
+			  s!\.!\\.!g;
+			  s!\*!.*!g;
+			  s!\?!.!g;
+			  $_;
+		      }
+		      @exclude) .
+		 ')$');
+print STDERR "exclude: $excluderx\n" if $debug;
+
+#--- Create user agent
+my $agent = new Ptwb::UserAgent(keep_alive => 1);
+#--- Use proxy
+if ($env->{'proxyurl'}) {
+    $agent->proxy('http',$env->{'proxyurl'});
+}
+
+if (defined $env->{'loginurl'}) {
+    &cookie_login($agent);
+}
+&ptwb_dir($agent,$env->{'url'},".");
+
+#-----------------------------------------------------------------------
+#	Post login request to authenticate session via cookie
+#-----------------------------------------------------------------------
+sub cookie_login {
+    my($agent) = @_;
+    # Read username:password from authfile
+    my($username,$password);
+    die "$0: No username specified for login credentials\n"
+	unless defined $env->{'username'};
+    die "$0: No password specified for login credentials\n"
+	unless defined $env->{'password'};
+
+    # Login page should set session cookie
+    my $cookies = new HTTP::Cookies;
+    $agent->cookie_jar($cookies);
+
+    # Create POST request
+    my $req = POST $env->{'loginurl'}, [username => $env->{'username'},
+					password => $env->{'password'}];
+    $req->header(Accept => '*/*');
+    if ($debug) {
+	print "POST ",$req->url->as_string,"\n";
+	print $req->headers_as_string, "\n";
+    }
+
+    #--- Send the request
+    my $response = $agent->request($req);
+    if ($debug) {
+	print $response->status_line, "\n";
+	print $response->headers_as_string, "\n";
+	print $response->content;
+    }
+
+    unless ($response->is_success ||
+    	    $response->is_redirect) {
+	die "login POST request failed: ".$response->status_line."\n";
+    }
+}
+
+#-----------------------------------------------------------------------
+#	Perform backup of a directory
+#-----------------------------------------------------------------------
+sub ptwb_dir {
+    my($agent,$baseurl,$dir) = @_;
+
+    my $url = URI->new($baseurl);
+    if ($env->{'pathencode'} eq 'rot13') {
+	$url->query_form('path13' => rot13($dir));
+    } else {
+	$url->query_form('path' => $dir);
+    }
+
+    my $req = HTTP::Request->new('GET');
+    $req->url($url);
+    $req->header(Accept => '*/*');
+    if ($debug) {
+	print "GET ",$req->url->as_string,"\n";
+	print $req->headers_as_string, "\n";
+    }
+
+    #--- Send the request
+    my $response = $agent->request($req);
+    if ($debug) {
+	print $response->status_line, "\n";
+	print $response->headers_as_string, "\n";
+	print $response->content;
+    }
+
+    if (! $response->is_success) {
+	die "GET request ($url) failed:\n  ".$response->status_line."\n";
+    } elsif ($response->content_type ne 'application/x-ptwb-dir') {
+	die "Response content type ".$response->content_type.
+	    ", expected application/x-ptwb-dir\n" .
+	($verbose ? $response->content : '');
+    } else {
+	sleep($throttle) if $throttle;
+	my @items = split /\n/, $response->content;
+	foreach my $item (@items) {
+	    my($type,$name,$mode,$size,$modtime,$link) = split / /,$item;
+	    #--- Decode URL-encoded name
+	    $name =~ s/\%([0-9A-F]{2})/chr(hex($1))/eg;
+	    $link =~ s/\%([0-9A-F]{2})/chr(hex($1))/eg;
+	    my $relname = "$dir/$name";
+	    $relname =~ s!^\./!!;
+	    if ($relname =~ /$excluderx/) {
+		print STDERR "Excluded  $relname\n" if $verbose;
+		next;
+	    }
+	    if ($type eq 'd') {
+		my $subdir = $relname;
+
+		# Ensure destination directory exists and is (at least
+		# temporarily) writable
+		unless (-d $subdir) {
+		    mkdir $subdir or 
+			die "Cannot create directory $subdir: $!\n";
+		    print STDERR "Newdir    $subdir\n" unless $silent;
+		}
+		chmod 0700, $subdir ||
+		    die "Cannot set permissions on $subdir to 700: $!\n";
+
+		#--- Recurse to subdirectory
+		&ptwb_dir($agent,$baseurl,$subdir);
+
+		# Change permissions to those on server
+		chmod oct($mode), $subdir ||
+		    die "Cannot set permissions on $subdir to $mode: $!\n";
+	    } elsif ($type eq 'f') {
+		my $file = $relname;
+		&ptwb_file($agent,$baseurl,$file,$mode,$size,$modtime);
+	    } elsif ($type eq 'l') {
+		# Create symlink
+		my $file = $relname;
+		if (-l $file) {
+		    if (readlink($file) eq $link) {
+			print STDERR "Skipping  $file\n" if $verbose;
+			next;
+		    }
+		    unlink $file;
+		} elsif (-f $file) {
+		    unlink $file;
+		} elsif (-d $file) {
+		    print STDERR "rm -fr $file\n" if $verbose;
+		    system('rm','-fr',$file);
+		}
+		symlink $link, $file or
+		    die "Cannot create symlink $file: $!\n";
+		print STDERR "Linking   $file\n" unless $silent;
+	    }
+	}
+    }
+}
+
+#-----------------------------------------------------------------------
+#	Backup a single file
+#-----------------------------------------------------------------------
+sub ptwb_file {
+    my($agent,$baseurl,$file,$mode,$size,$modtime) = @_;
+    if (-l $file) {
+	unlink($file);
+    } elsif (-f $file) {
+	my($lsize,$lmtime) = (stat $file)[7,9];
+	if ($size != $lsize) {
+	    print STDERR "size = $size, local = $lsize\n" if $verbose;
+	} elsif ($modtime != $lmtime) {
+	    print STDERR "modtime = $modtime, local = $lmtime\n" if $verbose;
+	} else {
+	    chmod oct($mode),$file;
+	    print STDERR "Skipping  $file\n" if $verbose;
+	    return;
+	}
+    }
+
+    my $url = URI->new($baseurl);
+    if ($env->{'pathencode'} eq 'rot13') {
+	$url->query_form('path13' => rot13($file));
+    } else {
+	$url->query_form('path' => $file);
+    }
+
+    my $response = $agent->mirror($url, $file);
+    if ($debug) {
+	print $response->status_line, "\n";
+	print $response->headers_as_string, "\n";
+#	print $response->content;
+    }
+
+    my $code = $response->code;
+    if ($code == 304) {
+	print STDERR "Unchanged $file\n" if $verbose;
+	sleep($throttle) if $throttle;
+    } elsif (! $response->is_success) {
+	die "mirror of $file failed: code=$code\n";
+    } else {
+	utime $modtime,$modtime, $file;
+	chmod oct($mode), $file;
+	print STDERR "Fetched   $file  $size\n" unless $silent;
+	sleep($throttle) if $throttle;
+    }
+}
+
+#-----------------------------------------------------------------------
+#	Read configuration file
+#-----------------------------------------------------------------------
+sub read_config {
+    my($confname) = @_;
+    open(my $conf,'<',$confname) || die "$0: Cannot open $confname: $!\n";
+    while (<$conf>) {
+	chomp;
+	next if /^#/;		# Skip comments
+	next unless /^\S/;	# and blank lines
+	my($cmd,$value) = split/\s+/, $_,2;
+	if ($cmd eq 'include') {
+	    &read_config($value);
+	} elsif ($cmd eq 'proxyauthfile') {
+	    my($username,$password) = &read_auth($value);
+	    $env->{'proxyusername'} = $username;
+	    $env->{'proxypassword'} = $password;
+	} elsif ($cmd eq 'authfile') {
+	    my($username,$password) = &read_auth($value);
+	    $env->{'username'} = $username;
+	    $env->{'password'} = $password;
+	} elsif ($cmd eq 'exclude') {
+	    push @exclude, $value;
+	} elsif ($cmd eq 'throttle') {
+	    $throttle = $value;
+	} elsif (exists $env->{$cmd}) {
+	    $env->{$cmd} = $value;
+	} else {
+	    die "Unknown configuration property $cmd\n";
+	}
+    }
+    close($conf);
+}
+
+sub read_auth {
+    my($authname) = @_;
+    open(AUTH,'<',$authname) || die "$0: Cannot open $authname: $!\n";
+    chomp(my $line = <AUTH>);
+    my($username,$password) = split(/:/, $line,2);
+    close(AUTH);
+    return ($username,$password);
+}
+
+sub rot13 {
+    my $text = shift;
+    $text =~ tr/A-Za-z/N-ZA-Mn-za-m/;
+    return $text;
+}
