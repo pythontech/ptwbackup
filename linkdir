@@ -1,0 +1,34 @@
+#!/usr/bin/perl
+#=======================================================================
+#	Hardlink directory recursively
+#=======================================================================
+use strict;
+
+sub lndir {
+    my($src,$dest) = @_;
+    if (! -d $dest) {
+	mkdir $dest
+	    or die "Cannot mkdir $dest: $!\n";
+    }
+    opendir(DIR,"$src")
+	or die "Cannot opendir $src: $!\n";
+    my @items = readdir(DIR);
+    closedir(DIR);
+    foreach my $item (@items) {
+	next if $item eq '.' || $item eq '..';
+	my $spath = "$src/$item";
+	my $dpath = "$dest/$item";
+	if (-l $spath) {
+	    my $link = readlink $spath;
+	    symlink $link, $dpath;
+	} elsif (-d $spath) {
+	    lndir($spath, $dpath);
+	} elsif (-f $spath) {
+	    link $spath, $dpath;
+	} else {
+	    print STDERR "$spath: Not a regular file/dir/symlink\n";
+	}
+    }
+}
+
+lndir(@ARGV);
